@@ -236,11 +236,11 @@ typedef struct _IceCheckList {
 	MSList *stun_server_requests;    /**< List of IceStunServerRequest structures */
 	MSList *local_candidates;        /**< List of IceCandidate structures */
 	MSList *remote_candidates;       /**< List of IceCandidate structures */
-	MSList *pairs;                   /**< List of IceCandidatePair structures */
+	MSList *pairs;                   /**< Owns all check pairs and separately constructed valid pairs. */
 	MSList *losing_pairs;            /**< List of IceCandidatePair structures */
 	MSList *triggered_checks_queue;  /**< List of IceCandidatePair structures */
-	MSList *check_list;              /**< List of IceCandidatePair structures */
-	MSList *valid_list;              /**< List of IceValidCandidatePair structures */
+	MSList *check_list;              /**< Schedulable checks; a subset of pairs, excluding mapped valid-only objects. */
+	MSList *valid_list;              /**< Valid results and their generating checks, both owned by pairs. */
 	MSList *foundations;             /**< List of IcePairFoundation structures */
 	MSList *local_componentIDs;      /**< List of uint16_t */
 	MSList *remote_componentIDs;     /**< List of uint16_t */

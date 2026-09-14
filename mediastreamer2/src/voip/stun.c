@@ -343,7 +343,9 @@ static uint8_t decode8(StunMessageDecoder *decoder) {
 }
 
 static uint16_t decode16(StunMessageDecoder *decoder) {
-	uint16_t value = ntohs(*((uint16_t *)decoder->ptr));
+	uint16_t value;
+	memcpy(&value, decoder->ptr, sizeof(value));
+	value = ntohs(value);
 	decoder->ptr += sizeof(uint16_t);
 	decoder->remaining -= sizeof(uint16_t);
 	if (decoder->remaining < 0) decoder->error = TRUE;
@@ -351,15 +353,19 @@ static uint16_t decode16(StunMessageDecoder *decoder) {
 }
 
 static uint32_t decode32(StunMessageDecoder *decoder) {
-	uint32_t value = ntohl(*((uint32_t *)decoder->ptr));
+	uint32_t value;
+	memcpy(&value, decoder->ptr, sizeof(value));
+	value = ntohl(value);
 	decoder->ptr += sizeof(uint32_t);
 	decoder->remaining -= sizeof(uint32_t);
 	if (decoder->remaining < 0) decoder->error = TRUE;
 	return value;
 }
 
-BCTBX_DISABLE_UBSAN static uint64_t decode64(StunMessageDecoder *decoder) {
-	uint64_t value = ntohq(*((uint64_t *)decoder->ptr));
+static uint64_t decode64(StunMessageDecoder *decoder) {
+	uint64_t value;
+	memcpy(&value, decoder->ptr, sizeof(value));
+	value = ntohq(value);
 	decoder->ptr += sizeof(uint64_t);
 	decoder->remaining -= sizeof(uint64_t);
 	if (decoder->remaining < 0) decoder->error = TRUE;
@@ -409,6 +415,11 @@ static MSStunAddress decode_addr(StunMessageDecoder *decoder, uint16_t length) {
 
 	decode8(decoder);
 	stun_addr.family = decode8(decoder);
+	if (!((stun_addr.family == MS_STUN_ADDR_FAMILY_IPV4 && length == 8) ||
+	      (stun_addr.family == MS_STUN_ADDR_FAMILY_IPV6 && length == 20))) {
+		decoder->error = TRUE;
+		goto error;
+	}
 	if (stun_addr.family == MS_STUN_ADDR_FAMILY_IPV6) {
 		stun_addr.ip.v6.port = decode16(decoder);
 		memcpy(&stun_addr.ip.v6.addr, decode(decoder, sizeof(UInt128)), sizeof(UInt128));
@@ -439,8 +450,8 @@ static uint32_t decode_change_request(StunMessageDecoder *decoder, uint16_t leng
 static char *decode_string(StunMessageDecoder *decoder, uint16_t length, uint16_t max_length) {
 	char *str;
 
-	if (length > max_length) {
-		ms_warning("STUN string attribute too long");
+	if (length > max_length || memchr(decoder->ptr, '\0', length) != NULL) {
+		ms_warning("STUN string attribute too long or contains a NUL byte");
 		decoder->error = TRUE;
 		return NULL;
 	}
@@ -722,7 +733,8 @@ MSStunMessage *ms_stun_message_create_from_buffer_parsing(const uint8_t *buf, ss
 	stun_message_decoder_init(&decoder, buf, bufsize);
 	decode_message_header(&decoder, msg);
 	if (decoder.error) goto error;
-	if ((ms_stun_message_get_length(msg) + STUN_MESSAGE_HEADER_LENGTH) != bufsize) {
+	if ((msg->length & 3) || (buf[0] & 0xc0) ||
+	    (ms_stun_message_get_length(msg) + STUN_MESSAGE_HEADER_LENGTH) != bufsize) {
 		ms_warning("STUN message header length does not match message size: %i - %zd", ms_stun_message_get_length(msg),
 		           bufsize);
 		goto error;
@@ -733,12 +745,20 @@ MSStunMessage *ms_stun_message_create_from_buffer_parsing(const uint8_t *buf, ss
 		uint16_t type;
 		uint16_t length;
 
+		if (decoder.remaining < 4) goto error;
 		decode_attribute_header(&decoder, &type, &length);
-		if (length > decoder.remaining) {
+		if ((((size_t)length + 3U) & ~(size_t)3) > (size_t)decoder.remaining) {
 			ms_error("STUN attribute larger than message (attribute type: 0x%4x)", type);
 			decoder.error = TRUE;
 		}
 		if (decoder.error) goto error;
+		/* Only FINGERPRINT may be processed after MESSAGE-INTEGRITY. Attributes
+		 * outside the authenticated prefix must not change ICE request semantics. */
+		if (msg->has_fingerprint) goto error;
+		if (msg->has_message_integrity && type != MS_STUN_ATTR_FINGERPRINT) {
+			decode(&decoder, ((size_t)length + 3) & ~(size_t)3);
+			continue;
+		}
 		switch (type) {
 			case MS_STUN_ATTR_MAPPED_ADDRESS:
 				ms_stun_message_set_mapped_address(msg, decode_addr(&decoder, length));
@@ -766,8 +786,9 @@ MSStunMessage *ms_stun_message_create_from_buffer_parsing(const uint8_t *buf, ss
 				break;
 			case MS_STUN_ATTR_MESSAGE_INTEGRITY:
 				msg->message_integrity = decode_message_integrity(&decoder, length);
+				if (decoder.error) goto error;
 				msg->has_message_integrity = TRUE;
-				if (strcmp(ms_stun_message_get_message_integrity(msg), "hmac-not-implemented") == 0)
+				if (memcmp(ms_stun_message_get_message_integrity(msg), "hmac-not-implemented", 20) == 0)
 					msg->has_dummy_message_integrity = TRUE;
 				break;
 			case MS_STUN_ATTR_ERROR_CODE: {
@@ -786,13 +807,18 @@ MSStunMessage *ms_stun_message_create_from_buffer_parsing(const uint8_t *buf, ss
 				if (software != NULL) ms_free(software);
 			} break;
 			case MS_STUN_ATTR_FINGERPRINT:
+				if (length != 4 || decoder.remaining != 4) goto error;
 				msg->fingerprint = decode_fingerprint(&decoder, length);
+				if (msg->fingerprint !=
+				    (ms_stun_calculate_fingerprint((const char *)buf, (size_t)(decoder.ptr - buf) - 8) ^ 0x5354554e))
+					goto error;
 				msg->has_fingerprint = TRUE;
 				break;
 			case MS_ICE_ATTR_PRIORITY:
 				ms_stun_message_set_priority(msg, decode_priority(&decoder, length));
 				break;
 			case MS_ICE_ATTR_USE_CANDIDATE:
+				if (length != 0) goto error;
 				ms_stun_message_enable_use_candidate(msg, TRUE);
 				break;
 			case MS_ICE_ATTR_ICE_CONTROLLED:
@@ -848,9 +874,7 @@ MSStunMessage *ms_stun_message_create_from_buffer_parsing(const uint8_t *buf, ss
 	return msg;
 
 error:
-	if (msg != NULL) {
-		ms_free(msg);
-	}
+	if (msg != NULL) ms_stun_message_destroy(msg);
 	return NULL;
 }
 
@@ -949,11 +973,12 @@ size_t ms_stun_message_encode(const MSStunMessage *msg, char **buf) {
 		const char *password = ms_stun_message_get_password(msg);
 		if (msg->ha1 != NULL) {
 			encode_long_term_integrity_from_ha1(&encoder, msg->ha1);
-		} else if ((username != NULL) && (password != NULL) && (strlen(username) > 0) && (strlen(password) > 0)) {
+		} else if ((password != NULL) && (strlen(password) > 0)) {
 			const char *realm = ms_stun_message_get_realm(msg);
 			if ((realm != NULL) && (strlen(realm) > 0)) {
-				encode_long_term_integrity(&encoder, realm, username, password);
+				if (username && *username) encode_long_term_integrity(&encoder, realm, username, password);
 			} else {
+				/* Short-term responses need only the password, not a USERNAME attribute. */
 				encode_short_term_integrity(&encoder, password, ms_stun_message_dummy_message_integrity_enabled(msg));
 			}
 		}
