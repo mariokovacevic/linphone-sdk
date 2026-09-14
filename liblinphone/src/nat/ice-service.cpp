@@ -181,7 +181,8 @@ void IceService::createStreams(const OfferAnswerContext &params) {
 		params.scopeStreamToIndex(index);
 
 		const auto streamDesc = params.getLocalStreamDescription();
-		bool streamActive = streamDesc.enabled() && (streamDesc.getDirection() != SalStreamInactive);
+		/* Hold changes media direction, not the ICE transport or generation. */
+		bool streamActive = streamDesc.enabled();
 
 		/* When rtp bundle is activated or going to be activated, we don't need ICE for the stream.*/
 		if (!params.localIsOfferer) {
@@ -500,7 +501,7 @@ void IceService::createIceCheckListsAndParseIceAttributes(const std::shared_ptr<
 			ice_check_list_set_state(cl, ICL_Failed);
 			continue;
 		}
-		if ((stream.rtp_port == 0) || (stream.getDirection() == SalStreamInactive)) {
+		if (stream.rtp_port == 0) {
 			ice_session_remove_check_list(mIceSession, cl);
 			mStreamsGroup.getStream(i)->setIceCheckList(nullptr);
 			continue;
@@ -593,8 +594,7 @@ void IceService::updateFromRemoteMediaDescription(const std::shared_ptr<SalMedia
 		if (!cl) continue;
 		if (i < remoteDesc->streams.size()) {
 			const auto &remoteDescStream = remoteDesc->streams[i];
-			if (remoteDescStream.enabled() && remoteDescStream.getRtpPort() != 0 &&
-			    remoteDescStream.getDirection() != SalStreamInactive) {
+			if (remoteDescStream.enabled() && remoteDescStream.getRtpPort() != 0) {
 				/*
 				 * rtp_port == 0 is true when it is a secondary stream part of bundle.
 				 */
@@ -652,8 +652,7 @@ void IceService::updateLocalMediaDescriptionFromIce(std::shared_ptr<SalMediaDesc
 		auto &stream = desc->streams[i];
 		IceCheckList *cl = ice_session_check_list(mIceSession, (int)i);
 		rtpCandidate = rtcpCandidate = nullptr;
-		if (!stream.enabled() || !cl || (stream.getRtpPort() == 0) || (stream.getDirection() == SalStreamInactive))
-			continue;
+		if (!stream.enabled() || !cl || (stream.getRtpPort() == 0)) continue;
 		if (ice_check_list_state(cl) == ICL_Completed) {
 			result = !!ice_check_list_selected_valid_local_candidate(ice_session_check_list(mIceSession, (int)i),
 			                                                         &rtpCandidate, &rtcpCandidate);
@@ -899,7 +898,9 @@ void IceService::handleIceEvent(const OrtpEvent *ev) {
 	const OrtpEventData *evd = ortp_event_get_data(const_cast<OrtpEvent *>(ev));
 	switch (evt) {
 		case ORTP_EVENT_ICE_SESSION_PROCESSING_FINISHED:
-			if (hasCompletedCheckList()) {
+			/* Deferred signaling must also be released if every checklist failed. */
+			if (mIceSession &&
+			    (ice_session_state(mIceSession) == IS_Completed || ice_session_state(mIceSession) == IS_Failed)) {
 				if (mListener) mListener->onIceCompleted(*this);
 			}
 			break;

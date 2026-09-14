@@ -742,6 +742,153 @@ end:
 	linphone_core_manager_destroy(pauline);
 }
 
+/* Exercise the media-direction lifecycle above the ICE engine, including the
+ * SDP that is actually sent and the checklist attached to the media receiver. */
+#ifdef VIDEO_ENABLED
+static void call_video_hold_resume_with_ice(void) {
+	LinphoneCoreManager *caller = linphone_core_manager_new("marie_rc");
+	LinphoneCoreManager *callee = linphone_core_manager_new("pauline_rc");
+	for (auto mgr : {caller, callee}) {
+		LinphoneNatPolicy *policy = linphone_core_create_nat_policy(mgr->lc);
+		linphone_nat_policy_enable_ice(policy, TRUE);
+		linphone_nat_policy_enable_stun(policy, FALSE);
+		linphone_core_set_nat_policy(mgr->lc, policy);
+		linphone_nat_policy_unref(policy);
+		linphone_config_set_int(linphone_core_get_config(mgr->lc), "rtp", "rtcp_mux", 1);
+		linphone_config_set_int(linphone_core_get_config(mgr->lc), "sip", "update_call_when_ice_completed", 0);
+		linphone_core_set_media_encryption(mgr->lc, LinphoneMediaEncryptionSRTP);
+		linphone_core_enable_video_capture(mgr->lc, TRUE);
+		linphone_core_enable_video_display(mgr->lc, TRUE);
+		linphone_core_set_video_device(mgr->lc, liblinphone_tester_mire_id);
+		disable_all_video_codecs_except_one(mgr->lc, "VP8");
+	}
+	LinphoneCallParams *params = linphone_core_create_call_params(caller->lc, nullptr);
+	linphone_call_params_enable_video(params, TRUE);
+	linphone_call_params_set_video_direction(params, LinphoneMediaDirectionSendOnly);
+	LinphoneCall *out = linphone_core_invite_address_with_params(caller->lc, callee->identity, params);
+	linphone_call_params_unref(params);
+	if (BC_ASSERT_PTR_NOT_NULL(out) &&
+	    BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc, &callee->stat.number_of_LinphoneCallIncomingReceived, 1))) {
+		LinphoneCall *in = linphone_core_get_current_call(callee->lc);
+		params = linphone_core_create_call_params(callee->lc, in);
+		linphone_call_params_enable_video(params, TRUE);
+		linphone_call_params_set_video_direction(params, LinphoneMediaDirectionRecvOnly);
+		BC_ASSERT_EQUAL(linphone_call_accept_with_params(in, params), 0, int, "%d");
+		linphone_call_params_unref(params);
+		BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc, &callee->stat.number_of_LinphoneCallStreamsRunning, 1));
+		BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc, &caller->stat.number_of_LinphoneCallStreamsRunning, 1));
+		if (BC_ASSERT_TRUE(check_ice(caller, callee, LinphoneIceStateHostConnection))) {
+			IceSession *ice = linphone_call_get_ice_session(in);
+			const int index = _linphone_call_get_main_video_stream_index(in);
+			IceCheckList *video = ice_session_check_list(ice, index);
+			if (BC_ASSERT_PTR_NOT_NULL(video)) {
+				const std::string ufrag = ice_session_local_ufrag(ice);
+				const auto *valid = video->valid_list->data;
+				for (int cycle = 0; cycle < 4; ++cycle) {
+					/* First hold a recvonly stream (becomes inactive), then enable sending
+					 * and repeat with sendrecv video (becomes sendonly on hold). */
+					if (cycle == 1) {
+						const int updates = caller->stat.number_of_LinphoneCallUpdatedByRemote;
+						const int running = callee->stat.number_of_LinphoneCallStreamsRunning;
+						linphone_config_set_int(linphone_core_get_config(caller->lc), "sip", "defer_update_default", 1);
+						params = linphone_core_create_call_params(callee->lc, in);
+						linphone_call_params_set_video_direction(params, LinphoneMediaDirectionSendRecv);
+						BC_ASSERT_EQUAL(linphone_call_update(in, params), 0, int, "%d");
+						linphone_call_params_unref(params);
+						BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc,
+						                        &caller->stat.number_of_LinphoneCallUpdatedByRemote, updates + 1));
+						params = linphone_core_create_call_params(caller->lc, out);
+						linphone_call_params_set_video_direction(params, LinphoneMediaDirectionSendRecv);
+						BC_ASSERT_EQUAL(linphone_call_accept_update(out, params), 0, int, "%d");
+						linphone_call_params_unref(params);
+						linphone_config_set_int(linphone_core_get_config(caller->lc), "sip", "defer_update_default", 0);
+						BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc,
+						                        &callee->stat.number_of_LinphoneCallStreamsRunning, running + 1));
+						BC_ASSERT_EQUAL(linphone_call_params_get_video_direction(linphone_call_get_current_params(in)),
+						                LinphoneMediaDirectionSendRecv, int, "%d");
+					}
+					const int running = callee->stat.number_of_LinphoneCallStreamsRunning;
+					const int peerRunning = caller->stat.number_of_LinphoneCallStreamsRunning;
+					BC_ASSERT_EQUAL(linphone_call_pause(in), 0, int, "%d");
+					if (!BC_ASSERT_TRUE(
+					        wait_for(caller->lc, callee->lc, &callee->stat.number_of_LinphoneCallPaused, cycle + 1)))
+						break;
+					/* Compare identities before dereferencing: the old implementation frees video here. */
+					if (!BC_ASSERT_PTR_EQUAL(ice_session_check_list(ice, index), video)) break;
+					BC_ASSERT_EQUAL(ice_session_state(ice), IS_Completed, int, "%d");
+					BC_ASSERT_EQUAL(ice_check_list_state(video), ICL_Completed, int, "%d");
+					BC_ASSERT_PTR_EQUAL(video->valid_list->data, valid);
+					const auto &sd = _linphone_call_get_local_desc(in)->streams.at(index);
+					BC_ASSERT_TRUE(sd.hasIceCandidates());
+					if (cycle == 0) {
+						BC_ASSERT_EQUAL(sd.getDirection(), SalStreamInactive, int, "%d");
+						MediaStream *vs = linphone_call_get_stream(in, LinphoneStreamTypeVideo);
+						BC_ASSERT_PTR_EQUAL(vs->ice_check_list, video);
+						BC_ASSERT_EQUAL(vs->state, MSStreamPreparing, int, "%d");
+					}
+					BC_ASSERT_EQUAL(linphone_call_resume(in), 0, int, "%d");
+					if (!BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc,
+					                             &callee->stat.number_of_LinphoneCallStreamsRunning, running + 1)))
+						break;
+					BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc, &caller->stat.number_of_LinphoneCallStreamsRunning,
+					                        peerRunning + 1));
+					BC_ASSERT_PTR_EQUAL(ice_session_check_list(ice, index), video);
+					BC_ASSERT_STRING_EQUAL(ice_session_local_ufrag(ice), ufrag.c_str());
+					BC_ASSERT_TRUE(_linphone_call_get_local_desc(in)->streams.at(index).hasIceCandidates());
+					BC_ASSERT_TRUE(check_ice(caller, callee, LinphoneIceStateHostConnection));
+				}
+			}
+		}
+		end_call(caller, callee);
+	}
+	linphone_core_manager_destroy(caller);
+	linphone_core_manager_destroy(callee);
+}
+#endif
+
+static void call_resume_after_ice_failure(void) {
+	LinphoneCoreManager *caller = linphone_core_manager_new("marie_rc");
+	LinphoneCoreManager *callee = linphone_core_manager_new("pauline_rc");
+	for (auto mgr : {caller, callee}) {
+		LinphoneNatPolicy *policy = linphone_core_create_nat_policy(mgr->lc);
+		linphone_nat_policy_enable_ice(policy, TRUE);
+		linphone_nat_policy_enable_stun(policy, FALSE);
+		linphone_core_set_nat_policy(mgr->lc, policy);
+		linphone_nat_policy_unref(policy);
+		linphone_config_set_int(linphone_core_get_config(mgr->lc), "sip", "update_call_when_ice_completed", 0);
+	}
+	if (BC_ASSERT_TRUE(call(caller, callee)) &&
+	    BC_ASSERT_TRUE(check_ice(caller, callee, LinphoneIceStateHostConnection))) {
+		LinphoneCall *in = linphone_core_get_current_call(callee->lc);
+		BC_ASSERT_EQUAL(linphone_call_pause(in), 0, int, "%d");
+		if (BC_ASSERT_TRUE(wait_for(caller->lc, callee->lc, &callee->stat.number_of_LinphoneCallPaused, 1))) {
+			IceSession *ice = linphone_call_get_ice_session(in);
+			IceCheckList *audio = ice_session_check_list(ice, _linphone_call_get_main_audio_stream_index(in));
+			const int resuming = callee->stat.number_of_LinphoneCallResuming;
+			const int running = callee->stat.number_of_LinphoneCallStreamsRunning;
+			/* Deterministically queue resume behind unfinished ICE, then finish with failure. */
+			for (const bctbx_list_t *it = audio->valid_list; it; it = it->next) {
+				auto *valid = static_cast<IceValidCandidatePair *>(it->data);
+				valid->valid->is_nominated = FALSE;
+			}
+			ice_check_list_set_state(audio, ICL_Running);
+			BC_ASSERT_EQUAL(linphone_call_resume(in), 0, int, "%d");
+			BC_ASSERT_EQUAL(callee->stat.number_of_LinphoneCallResuming, resuming, int, "%d");
+			ice_check_list_set_state(audio, ICL_Failed);
+			ice->event_time.tv_sec = ice->event_time.tv_nsec = 0;
+			ice_check_list_process(audio, audio->rtp_session);
+			BC_ASSERT_TRUE(
+			    wait_for(caller->lc, callee->lc, &callee->stat.number_of_LinphoneCallResuming, resuming + 1));
+			BC_ASSERT_TRUE(
+			    wait_for(caller->lc, callee->lc, &callee->stat.number_of_LinphoneCallStreamsRunning, running + 1));
+			BC_ASSERT_EQUAL(ice_session_state(ice), IS_Failed, int, "%d");
+		}
+		end_call(caller, callee);
+	}
+	linphone_core_manager_destroy(caller);
+	linphone_core_manager_destroy(callee);
+}
+
 static void call_paused_resumed_with_caller_ice() {
 	call_paused_resumed_with_ice(LinphoneMediaEncryptionNone, TRUE, FALSE, FALSE);
 }
@@ -981,6 +1128,11 @@ end:
 }
 
 static test_t call_with_ice_tests[] = {
+#ifdef VIDEO_ENABLED
+    TEST_TWO_TAGS(
+        "One-way video activation and repeated hold/resume with ICE", call_video_hold_resume_with_ice, "ICE", "Video"),
+#endif
+    TEST_ONE_TAG("Resume deferred until ICE failure", call_resume_after_ice_failure, "ICE"),
     TEST_ONE_TAG("Call with ICE in IPv4 with IPv6 enabled", call_with_ice_in_ipv4_with_v6_enabled, "ICE"),
     TEST_ONE_TAG("Call with ICE IPv4 to IPv6", call_with_ice_ipv4_to_ipv6, "ICE"),
     TEST_ONE_TAG("Call with ICE IPv6 to IPv4", call_with_ice_ipv6_to_ipv4, "ICE"),

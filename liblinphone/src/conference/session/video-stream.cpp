@@ -633,7 +633,13 @@ void MS2VideoStream::render(const OfferAnswerContext &ctx, CallSession::State ta
 		enableLocalScreenSharing(false);
 		lWarning() << "Video stream is inactive";
 		/* Either inactive or incompatible with local capabilities */
+		const bool keepIce = mStream->ms.ice_check_list && vstream.enabled() && isTransportOwner();
 		stop();
+		if (keepIce) {
+			/* Keep the RTP receiver and event timer alive for ICE checks and NAT
+			 * keepalives while the media itself is on hold. */
+			prepare();
+		}
 		return;
 	}
 

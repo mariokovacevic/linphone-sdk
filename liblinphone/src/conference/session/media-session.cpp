@@ -3484,9 +3484,10 @@ void MediaSessionPrivate::onGatheringFinished(BCTBX_UNUSED(IceService &service))
 
 void MediaSessionPrivate::onIceCompleted(BCTBX_UNUSED(IceService &service)) {
 	L_Q();
-	/* The ICE session has succeeded, so perform a call update */
-	if (!getStreamsGroup().getIceService().hasCompletedCheckList()) return;
-	if (getStreamsGroup().getIceService().isControlling() && isUpdateSentWhenIceCompleted()) {
+	/* Advertise selected candidates after success. Deferred signaling must also
+	 * proceed when ICE ended without a successful checklist. */
+	if (getStreamsGroup().getIceService().hasCompletedCheckList() &&
+	    getStreamsGroup().getIceService().isControlling() && isUpdateSentWhenIceCompleted()) {
 		switch (state) {
 			case CallSession::State::StreamsRunning:
 			case CallSession::State::Paused:
@@ -4942,9 +4943,7 @@ LinphoneStatus MediaSession::resume() {
 
 	updateContactAddressInOp();
 
-	const auto isIceRunning = getStreamsGroup().getIceService().isRunning();
-
-	auto retryableAction = [this, isIceRunning, subject]() -> int {
+	auto retryableAction = [this, subject]() -> int {
 		L_D();
 		auto updateCompletionTask = [this, subject]() -> int {
 			L_D();
@@ -4985,7 +4984,7 @@ LinphoneStatus MediaSession::resume() {
 			        << " remote address " << getRemoteAddress()->toString() << ") resume to gather ICE candidates";
 			d->queueIceGatheringTask(updateCompletionTask);
 			return 0;
-		} else if (isIceRunning) {
+		} else if (getStreamsGroup().getIceService().isRunning()) {
 			// ICE negotiations are ongoing hence the update cannot be send right now
 			lInfo() << "Ice negotiations are ongoing and resume once they complete, therefore defer CallSession "
 			        << this << " (local address " << getLocalAddress()->toString() << " remote address "
