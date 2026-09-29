@@ -35,6 +35,12 @@ static bool_t queue_packet(queue_t *q, int maxrqsz, mblk_t *mp, rtp_header_t *rt
 	*discarded = 0;
 	*duplicate = 0;
 	header_size = RTP_FIXED_HEADER_SIZE + (4 * rtp->cc);
+	if (rtp->extbit == 1) {
+		/* Take the extension header into account when detecting packets without payload, so that header-only
+		 * packets (e.g. keepalive packets) are discarded even when they carry an extension. */
+		int extsize = rtp_get_extheader(mp, NULL, NULL);
+		if (extsize >= 0) header_size += 4 + extsize;
+	}
 	if ((mp->b_wptr - mp->b_rptr) == header_size) {
 		ortp_debug("Rtp packet contains no data.");
 		(*discarded)++;
