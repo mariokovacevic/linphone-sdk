@@ -119,6 +119,58 @@ static void send_stun_packet(SenderData *d, bool_t enable_rtp, bool_t enable_rtc
 	ms_stun_message_destroy(msg);
 }
 
+/* Send a dummy RTP packet to open NAT ports and trigger endpoint learning on media relays (e.g. rtpengine), which do
+ * not learn our address from STUN packets. Unlike STUN packets, it goes through the regular send path, so it is
+ * encrypted when SRTP is in use. */
+static void send_dummy_rtp_packet(SenderData *d, uint32_t timestamp) {
+	RtpSession *s = d->session;
+	PayloadType *send_pt;
+	int payload_type = -1;
+	bool_t comfort_noise = FALSE;
+	mblk_t *mp;
+	rtp_header_t *rtp;
+
+	if (!d->stun_enabled || d->stun_forced_enabled) return;
+	if (ms_is_multicast_addr((const struct sockaddr *)&s->rtp.gs.loc_addr)) {
+		ms_debug("Dummy RTP packet not sent for session [%p] because of multicast", s);
+		return;
+	}
+
+	send_pt = rtp_profile_get_payload(s->snd.profile, rtp_session_get_send_payload_type(s));
+	if (send_pt != NULL && send_pt->type != PAYLOAD_VIDEO) {
+		/* Prefer a comfort noise payload type when available, so that the packet is silent for the remote end. */
+		payload_type = rtp_profile_find_payload_number(s->snd.profile, "CN", d->rate, 1);
+		if (payload_type == -1) payload_type = rtp_profile_find_payload_number(s->snd.profile, "CN", 8000, 1);
+		if (payload_type != -1) comfort_noise = TRUE;
+	}
+	if (payload_type == -1) payload_type = rtp_session_get_send_payload_type(s);
+	if (payload_type == -1) {
+		ms_warning("Dummy RTP packet not sent for session [%p] because no payload type is set", s);
+		return;
+	}
+
+	if (comfort_noise) {
+		/* A one-byte payload holding the zero noise level, just like the CN packets sent on mute. */
+		mp = rtp_session_create_packet_header(s, 1);
+		rtp = (rtp_header_t *)mp->b_rptr;
+		rtp->paytype = payload_type;
+		*mp->b_wptr++ = 0;
+	} else {
+		/* Send a header-only packet, without any payload: will be encrypted if SRTP used (it appends the
+		 * authentication tag after the RTP header). Strip any extension header (e.g. the MID when bundled). */
+		mp = rtp_session_create_packet_header(s, 0);
+		rtp = (rtp_header_t *)mp->b_rptr;
+		rtp->paytype = payload_type;
+		if (rtp->extbit == 1) {
+			rtp->extbit = 0;
+			mp->b_wptr = mp->b_rptr + RTP_FIXED_HEADER_SIZE + (4 * rtp->cc);
+		}
+	}
+
+	ms_message("Dummy RTP packet of length %0zd sent on rtp for session [%p]", msgdsize(mp), s);
+	rtp_session_sendm_with_ts(s, mp, timestamp);
+}
+
 static void sender_init(MSFilter *f) {
 	SenderData *d = (SenderData *)ms_new0(SenderData, 1);
 	const char *tmp = NULL;
@@ -207,7 +259,11 @@ static int sender_set_session(MSFilter *f, void *arg) {
 		d->dtmf_ts_step = (20 * d->rate) / 1000;
 		/*Tolerate more jitter in video streams, knowing that video packets are not discarded if they are late*/
 		d->timestamp_adjustment_threshold = (pt->type == PAYLOAD_VIDEO) ? d->rate : d->rate / 5;
-		send_stun_packet(d, TRUE, TRUE);
+		if (d->stun_enabled && !d->stun_forced_enabled) {
+			send_stun_packet(d, FALSE, TRUE);
+		} else {
+			send_stun_packet(d, TRUE, TRUE);
+		}
 	} else {
 		ms_warning("Sending undefined payload type ?");
 	}
@@ -458,19 +514,18 @@ static int send_dtmf(MSFilter *f, uint32_t timestamp_start) {
 static void check_stun_sending(MSFilter *f) {
 	SenderData *d = (SenderData *)f->data;
 	RtpSession *s = d->session;
-	/* No need to send stun packets if media was sent during last 20s (or the last 2s while we still have not sent any
-	 * packets) */
-	uint64_t last_sent_timeout = 20000;
-	if (rtp_session_get_stats(s)->packet_sent == 0) last_sent_timeout = 2000;
-
+	/* Send keep-alives every 500 ms: always in "forced" mode, while no media packet has been sent at all (e.g.
+	 * recv-only streams), or when none has been sent for more than 20s. Keep-alives update packet_sent but not
+	 * d->last_sent_time. */
 	if ((d->last_rtp_stun_sent_time == -1) ||
-	    ((d->stun_forced_enabled || ((f->ticker->time - d->last_sent_time) > last_sent_timeout)) &&
+	    ((d->stun_forced_enabled || (d->last_sent_time == -1) || ((f->ticker->time - d->last_sent_time) > 20000)) &&
 	     (f->ticker->time - d->last_rtp_stun_sent_time) >= 500)) {
-		/* send stun packet every 500 ms:
-		 * - in absence of any RTP packet for more than last_sent_timeout
-		 * - or always in "forced" mode */
 		d->last_rtp_stun_sent_time = f->ticker->time;
-		send_stun_packet(d, TRUE, FALSE);
+		if (d->stun_enabled && !d->stun_forced_enabled) {
+			send_dummy_rtp_packet(d, get_cur_timestamp(f, NULL));
+		} else {
+			send_stun_packet(d, TRUE, FALSE);
+		}
 	}
 
 	if (rtp_session_rtcp_enabled(s) &&

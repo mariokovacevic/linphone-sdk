@@ -563,7 +563,10 @@ int ms_srtp_process_on_send(RtpTransportModifier *t, mblk_t *m) {
 	rtp_header_t *rtp_header = (rtp_header_t *)m->b_rptr;
 	slen = (int)msgdsize(m);
 
-	if (rtp_header && (slen > RTP_FIXED_HEADER_SIZE && rtp_header->version == 2)) {
+	/* Header-only packets (no payload) are supported: srtp_protect() simply appends the authentication tag to the
+	 * RTP header, as the encrypted portion of such a packet is empty. This allows e.g. keepalive packets to be
+	 * sent encrypted. */
+	if (rtp_header && (slen >= RTP_FIXED_HEADER_SIZE && rtp_header->version == 2)) {
 		size_t ekt_tag_size = 0;
 		std::vector<uint8_t> ekt_tag{};
 		std::lock_guard<std::recursive_mutex> lock(ctx->mMutex);
