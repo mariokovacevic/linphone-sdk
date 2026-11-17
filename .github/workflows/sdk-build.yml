@@ -1,0 +1,192 @@
+name: SDK build (iOS SPM + Android AAR)
+
+on:
+  push:
+    branches:
+      - '5.5.16-ice-pinhole*'
+  workflow_dispatch:
+
+concurrency:
+  group: sdk-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-spm:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout (full history + tags, needed for SDK version)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Init submodules
+        run: |
+          git submodule init
+          # Relative URLs (../bcg729.git) would resolve to this fork, where they do not exist.
+          git config submodule.bcg729.url https://gitlab.linphone.org/BC/public/bcg729.git
+          git config submodule.bcmatroska2.url https://gitlab.linphone.org/BC/public/bcmatroska2.git
+          # --init is needed so nested submodules (e.g. external/mbedtls/framework) are fetched too
+          git submodule update --init --recursive --jobs 8
+          git submodule status
+          git describe --tags
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          brew install ninja yasm nasm doxygen meson
+          python -m pip install --upgrade pip pystache six
+          cmake --version
+
+      - name: Configure
+        run: |
+          cmake --preset=ios-sdk -B build/ios -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLINPHONESDK_IOS_ARCHS="arm64,x86_64" \
+            -DLINPHONESDK_IOS_PLATFORM=Both \
+            -DPython3_EXECUTABLE="$(which python)"
+
+      - name: Build
+        run: cmake --build build/ios -j "$(sysctl -n hw.ncpu)"
+
+      - name: Show SDK version and package
+        run: |
+          grep LINPHONESDK_VERSION_CACHED build/ios/CMakeCache.txt
+          ls -la build/ios/linphone-sdk-swift-ios build/ios/linphone-sdk-swift-ios/XCFrameworks
+          du -sh build/ios/linphone-sdk-swift-ios
+
+      - name: Verify Swift package compiles (iOS + simulator)
+        working-directory: build/ios/linphone-sdk-swift-ios
+        run: |
+          xcodebuild -scheme linphonesw -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd" build CODE_SIGNING_ALLOWED=NO
+          xcodebuild -scheme linphonesw -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/dd" build CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload Swift package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linphone-sdk-swift-ios
+          path: build/ios/linphone-sdk-swift-ios
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: |
+            build/ios/CMakeCache.txt
+            build/ios/**/CMakeFiles/CMakeOutput.log
+            build/ios/**/CMakeFiles/CMakeError.log
+            build/ios/**/CMakeFiles/CMakeConfigureLog.yaml
+            build/ios/**/*-prefix/src/*-stamp/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  android-aar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      # Same NDK major as upstream CI image (bc-dev-android-r27)
+      NDK_VERSION: '27.0.12077973'
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: false
+          tool-cache: false
+          docker-images: true
+          large-packages: true
+          dotnet: true
+          haskell: true
+          swap-storage: false
+
+      - name: Checkout (full history + tags, needed for SDK version)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Init submodules
+        run: |
+          git submodule init
+          git config submodule.bcg729.url https://gitlab.linphone.org/BC/public/bcg729.git
+          git config submodule.bcmatroska2.url https://gitlab.linphone.org/BC/public/bcmatroska2.git
+          git submodule update --init --recursive --jobs 8
+          git submodule status
+          git describe --tags
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build yasm nasm doxygen meson pkg-config
+          python -m pip install --upgrade pip pystache six
+          cmake --version
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" "platforms;android-31"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake --preset=android-sdk -B build/android -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLINPHONESDK_ANDROID_ARCHS="arm64, armv7, x86_64" \
+            -DPython3_EXECUTABLE="$(which python)"
+
+      - name: Build
+        run: cmake --build build/android -j "$(nproc)"
+
+      - name: Show SDK version and outputs
+        run: |
+          grep LINPHONESDK_VERSION_CACHED build/android/CMakeCache.txt
+          ls -la build/android/linphone-sdk/bin/outputs/aar/ || true
+          ls -la build/android/linphone-sdk/bin/distributions/ || true
+          df -h .
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: linphone-sdk-android
+          path: |
+            build/android/linphone-sdk/bin/outputs/aar/*.aar
+            build/android/linphone-sdk/bin/libs/linphone-sdk-android-sources.jar
+            build/android/linphone-sdk/bin/distributions/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs
+          path: |
+            build/android/CMakeCache.txt
+            build/android/**/CMakeFiles/CMakeOutput.log
+            build/android/**/CMakeFiles/CMakeError.log
+            build/android/**/CMakeFiles/CMakeConfigureLog.yaml
+            build/android/**/*-prefix/src/*-stamp/*.log
+          if-no-files-found: ignore
+          retention-days: 7
