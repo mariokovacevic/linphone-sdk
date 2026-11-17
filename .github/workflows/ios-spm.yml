@@ -28,7 +28,8 @@ jobs:
           # Relative URLs (../bcg729.git) would resolve to this fork, where they do not exist.
           git config submodule.bcg729.url https://gitlab.linphone.org/BC/public/bcg729.git
           git config submodule.bcmatroska2.url https://gitlab.linphone.org/BC/public/bcmatroska2.git
-          git submodule update --recursive --jobs 8
+          # --init is needed so nested submodules (e.g. external/mbedtls/framework) are fetched too
+          git submodule update --init --recursive --jobs 8
           git submodule status
           git describe --tags
 
