@@ -155,6 +155,12 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: false
+          # Wrapper JARs in submodules (mediastreamer2/java, msoboe OboeTester) that are
+          # not in Gradle's known-checksum list. The build itself uses
+          # cmake/Android/gradlew, which still gets validated.
+          allow-checksums: |
+            83d62920cd4ddbdc969416e185b9959fac3d017e2a7faddb53f0eb5ba0174467
+            e2b82129ab64751fd40437007bd2f7f2afb3c6e41a9198e628650b22d5824a14
 
       # Retry dependency downloads with backoff instead of failing on the first 429.
       - name: Configure Gradle download retries
