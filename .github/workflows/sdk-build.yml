@@ -149,6 +149,25 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" "platforms;android-31"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
+      # Cache Gradle dependencies so the final AAR packaging step does not have to
+      # download everything from Maven Central on every run (it got rate-limited, HTTP 429).
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      # Retry dependency downloads with backoff instead of failing on the first 429.
+      - name: Configure Gradle download retries
+        run: |
+          mkdir -p ~/.gradle
+          cat >> ~/.gradle/gradle.properties <<'EOF'
+          systemProp.org.gradle.internal.repository.max.retries=10
+          systemProp.org.gradle.internal.repository.initial.backoff=2000
+          systemProp.org.gradle.internal.http.connectionTimeout=120000
+          systemProp.org.gradle.internal.http.socketTimeout=120000
+          EOF
+          cat ~/.gradle/gradle.properties
+
       - name: Configure
         run: |
           cmake --preset=android-sdk -B build/android -G Ninja \
