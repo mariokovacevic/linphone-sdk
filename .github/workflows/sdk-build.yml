@@ -49,7 +49,7 @@ jobs:
       - name: Configure
         run: |
           cmake --preset=ios-sdk -B build/ios -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_BUILD_TYPE=Release \
             -DLINPHONESDK_IOS_ARCHS="arm64,x86_64" \
             -DLINPHONESDK_IOS_PLATFORM=Both \
             -DPython3_EXECUTABLE="$(which python)"
@@ -152,7 +152,7 @@ jobs:
       - name: Configure
         run: |
           cmake --preset=android-sdk -B build/android -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_BUILD_TYPE=Release \
             -DLINPHONESDK_ANDROID_ARCHS="arm64, armv7, x86_64" \
             -DPython3_EXECUTABLE="$(which python)"
 
@@ -166,9 +166,8 @@ jobs:
           ls -la build/android/linphone-sdk/bin/distributions/ || true
           df -h .
 
-      # Only the release AAR goes into the app project. The debug AAR, the Maven
-      # distribution zip (which repackages both AARs) and the unstripped libs were
-      # ~750 MB of the old artifact and are not needed for integration.
+      # Only the release AAR goes into the app project (Release build runs
+      # assembleRelease only, so no debug AAR is produced).
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
@@ -177,17 +176,6 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
-
-      # Unstripped .so files, only needed to symbolicate native crashes
-      # (e.g. Play Console native debug symbols). Separate artifact, download on demand.
-      - name: Upload native debug symbols
-        uses: actions/upload-artifact@v4
-        with:
-          name: linphone-sdk-android-debug-symbols
-          path: build/android/linphone-sdk/bin/distributions/linphone-sdk-android-libs-debug.zip
-          if-no-files-found: warn
-          compression-level: 0
-          retention-days: 7
 
       - name: Upload logs on failure
         if: failure()
