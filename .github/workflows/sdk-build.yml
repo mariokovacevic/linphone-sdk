@@ -166,16 +166,28 @@ jobs:
           ls -la build/android/linphone-sdk/bin/distributions/ || true
           df -h .
 
+      # Only the release AAR goes into the app project. The debug AAR, the Maven
+      # distribution zip (which repackages both AARs) and the unstripped libs were
+      # ~750 MB of the old artifact and are not needed for integration.
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
           name: linphone-sdk-android
-          path: |
-            build/android/linphone-sdk/bin/outputs/aar/*.aar
-            build/android/linphone-sdk/bin/libs/linphone-sdk-android-sources.jar
-            build/android/linphone-sdk/bin/distributions/*.zip
+          path: build/android/linphone-sdk/bin/outputs/aar/linphone-sdk-android-release.aar
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
+
+      # Unstripped .so files, only needed to symbolicate native crashes
+      # (e.g. Play Console native debug symbols). Separate artifact, download on demand.
+      - name: Upload native debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: linphone-sdk-android-debug-symbols
+          path: build/android/linphone-sdk/bin/distributions/linphone-sdk-android-libs-debug.zip
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
 
       - name: Upload logs on failure
         if: failure()
